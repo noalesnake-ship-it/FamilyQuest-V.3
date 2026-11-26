@@ -1,0 +1,164 @@
+// FamilyQuest — Worker Cloudflare « abonnement »
+// Secrets (wrangler secret put …) : STRIPE_SECRET, STRIPE_WEBHOOK_SECRET, SA_EMAIL, SA_KEY (clé privée PEM du compte de service)
+// Variables (wrangler.toml [vars]) : PROJECT_ID, FIREBASE_API_KEY, PRICE_ID, ALLOWED_ORIGIN, APP_URL, ADMIN_EMAILS (liste séparée par des virgules)
+// Principe : la formule vit dans Firestore : families/{fid}.billing = {plan:'free'|'paid'|'gift', status, until, customer}
+// Seul ce Worker écrit ce champ (règles Firestore : lecture seule pour les clients).
+
+const J = (o, s, h) => new Response(JSON.stringify(o), { status: s || 200, headers: Object.assign({ 'content-type': 'application/json' }, h || {}) });
+const cors = (env) => ({ 'access-control-allow-origin': env.ALLOWED_ORIGIN, 'access-control-allow-headers': 'content-type', 'access-control-allow-methods': 'POST,OPTIONS', 'vary': 'origin' });
+
+export default {
+  async fetch(req, env) {
+    const url = new URL(req.url), C = cors(env);
+    if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: C });
+    if (req.method !== 'POST') return J({ error: 'method' }, 405, C);
+    try {
+      if (url.pathname === '/stripe-webhook') return await webhook(req, env);
+      if (req.headers.get('origin') !== env.ALLOWED_ORIGIN) return J({ error: 'origin' }, 403, C);
+      const b = await req.json();
+      const u = await verifyUser(b.idToken, env);              // {uid,email,verified}
+      const fam = await tutorFamily(u.uid, b.fid, env);        // refuse si pas tuteur de cette famille
+      if (url.pathname === '/sync') return J(await sync(u, fam, env), 200, C);
+      if (url.pathname === '/checkout') return J(await checkout(u, fam, b, env), 200, C);
+      if (url.pathname === '/portal') return J(await portal(fam, env), 200, C);
+      return J({ error: 'route' }, 404, C);
+    } catch (e) {
+      return J({ error: String(e.message || e) }, e.status || 400, C);
+    }
+  }
+};
+
+// ---------- Identité : on demande à Firebase de valider le jeton ----------
+async function verifyUser(idToken, env) {
+  if (!idToken) throw httpErr('no token', 401);
+  const r = await fetch('https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=' + env.FIREBASE_API_KEY, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ idToken })
+  });
+  if (!r.ok) throw httpErr('bad token', 401);
+  const u = (await r.json()).users[0];
+  return { uid: u.localId, email: (u.email || '').toLowerCase(), verified: !!u.emailVerified };
+}
+const httpErr = (m, s) => Object.assign(new Error(m), { status: s });
+
+// ---------- Droits : l'utilisateur doit être tuteur de la famille demandée ----------
+async function tutorFamily(uid, fid, env) {
+  if (!fid) throw httpErr('no family', 400);
+  // Source de confiance : le document people de la famille (le document users peut etre cree par l'utilisateur lui-meme).
+  const p = await fsGet('families/' + fid + '/people/' + uid, env);
+  if (!p || p.role !== 'tuteur') throw httpErr('not a guardian of this family', 403);
+  const fam = (await fsGet('families/' + fid, env)) || {};
+  return { fid, billing: fam.billing || {} };
+}
+
+// ---------- Exemption : adresse e-mail VÉRIFIÉE présente dans la liste secrète ----------
+async function sync(u, fam, env) {
+  const admins = (env.ADMIN_EMAILS || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+  if (u.verified && admins.includes(u.email)) {
+    await setBilling(fam.fid, { plan: 'gift', status: 'gift' }, env);
+    return { plan: 'gift' };
+  }
+  return { plan: fam.billing.plan || 'free', status: fam.billing.status || null, until: fam.billing.until || null };
+}
+
+// ---------- Stripe ----------
+async function stripe(path, params, env) {
+  const r = await fetch('https://api.stripe.com/v1/' + path, {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + env.STRIPE_SECRET, 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params)
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error((j.error && j.error.message) || 'stripe');
+  return j;
+}
+
+async function checkout(u, fam, b, env) {
+  if (!u.verified) throw httpErr('email not verified', 403);
+  if (fam.billing.plan === 'gift') throw new Error('already free');
+  const p = {
+    mode: 'subscription',
+    'line_items[0][price]': env.PRICE_ID,
+    'line_items[0][quantity]': '1',
+    'subscription_data[trial_period_days]': '30',
+    'subscription_data[metadata][fid]': fam.fid,
+    client_reference_id: fam.fid,
+    allow_promotion_codes: 'true',                          // champ « code promo » sur la page de paiement
+    'consent_collection[terms_of_service]': 'required',     // lien CGV à renseigner dans le tableau de bord Stripe
+    locale: b.lang === 'en' ? 'en' : 'fr',
+    success_url: env.APP_URL + '?abo=ok',
+    cancel_url: env.APP_URL + '?abo=non'
+  };
+  if (fam.billing.customer) p.customer = fam.billing.customer; else p.customer_email = u.email;
+  const s = await stripe('checkout/sessions', p, env);
+  return { url: s.url };
+}
+
+async function portal(fam, env) {
+  if (!fam.billing.customer) throw new Error('no customer');
+  const s = await stripe('billing_portal/sessions', { customer: fam.billing.customer, return_url: env.APP_URL }, env);
+  return { url: s.url };
+}
+
+// ---------- Webhook Stripe : seul endroit qui passe une famille en « paid » ----------
+async function webhook(req, env) {
+  const body = await req.text();
+  const sig = req.headers.get('stripe-signature') || '';
+  const t = (sig.match(/t=(\d+)/) || [])[1];
+  const v1 = (sig.match(/v1=([a-f0-9]+)/) || [])[1];
+  if (!t || !v1 || Math.abs(Date.now() / 1000 - Number(t)) > 300) return J({ error: 'sig' }, 400);
+  if (!(await hmacHex(env.STRIPE_WEBHOOK_SECRET, t + '.' + body) === v1)) return J({ error: 'sig' }, 400);
+  const ev = JSON.parse(body), o = ev.data.object;
+  if (ev.type === 'checkout.session.completed' && o.client_reference_id) {
+    await setBilling(o.client_reference_id, { customer: o.customer, status: 'active', plan: 'paid' }, env, true);
+  } else if (ev.type === 'customer.subscription.updated' || ev.type === 'customer.subscription.deleted') {
+    const fid = o.metadata && o.metadata.fid;
+    if (fid) {
+      const ok = ['active', 'trialing'].includes(o.status) && ev.type !== 'customer.subscription.deleted';
+      await setBilling(fid, { customer: o.customer, status: o.status, plan: ok ? 'paid' : 'free', until: (o.current_period_end || 0) * 1000 }, env, true);
+    }
+  }
+  return J({ ok: true });
+}
+async function hmacHex(secret, msg) {
+  const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const s = await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg));
+  return [...new Uint8Array(s)].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
+// ---------- Firestore REST via compte de service ----------
+let tok = { v: '', exp: 0 };
+async function accessToken(env) {
+  if (tok.v && Date.now() < tok.exp) return tok.v;
+  const b64 = (o) => btoa(typeof o === 'string' ? o : JSON.stringify(o)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const now = Math.floor(Date.now() / 1000);
+  const head = b64({ alg: 'RS256', typ: 'JWT' });
+  const claim = b64({ iss: env.SA_EMAIL, scope: 'https://www.googleapis.com/auth/datastore', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 });
+  const pem = env.SA_KEY.replace(/\\n/g, '\n').replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
+  const key = await crypto.subtle.importKey('pkcs8', Uint8Array.from(atob(pem), c => c.charCodeAt(0)), { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(head + '.' + claim));
+  const jwt = head + '.' + claim + '.' + btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: jwt }) });
+  const j = await r.json();
+  if (!r.ok) throw new Error('service account');
+  tok = { v: j.access_token, exp: Date.now() + 3300 * 1000 };
+  return tok.v;
+}
+const base = (env) => 'https://firestore.googleapis.com/v1/projects/' + env.PROJECT_ID + '/databases/(default)/documents/';
+const fromFs = (f) => { const o = {}; for (const k in f) { const v = f[k]; o[k] = 'stringValue' in v ? v.stringValue : 'integerValue' in v ? Number(v.integerValue) : 'mapValue' in v ? fromFs(v.mapValue.fields || {}) : 'booleanValue' in v ? v.booleanValue : null; } return o; };
+async function fsGet(path, env) {
+  const r = await fetch(base(env) + path, { headers: { authorization: 'Bearer ' + await accessToken(env) } });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error('firestore');
+  return fromFs((await r.json()).fields || {});
+}
+async function setBilling(fid, patch, env, merge) {
+  const cur = merge ? ((await fsGet('families/' + fid, env)) || {}).billing || {} : {};
+  const all = Object.assign({}, cur, patch);
+  const fields = {};
+  for (const k in all) { const v = all[k]; if (v == null) continue; fields[k] = typeof v === 'number' ? { integerValue: String(v) } : { stringValue: String(v) }; }
+  const r = await fetch(base(env) + 'families/' + fid + '?updateMask.fieldPaths=billing', {
+    method: 'PATCH', headers: { authorization: 'Bearer ' + await accessToken(env), 'content-type': 'application/json' },
+    body: JSON.stringify({ fields: { billing: { mapValue: { fields } } } })
+  });
+  if (!r.ok) throw new Error('firestore write');
+}

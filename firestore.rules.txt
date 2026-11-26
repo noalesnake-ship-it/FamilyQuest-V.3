@@ -1,0 +1,153 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function famPath(fid) { return /databases/$(database)/documents/families/$(fid); }
+    function personPath(fid, uid) { return /databases/$(database)/documents/families/$(fid)/people/$(uid); }
+    function isMember(fid) { return signedIn() && exists(personPath(fid, request.auth.uid)); }
+    function isTutor(fid) { return isMember(fid) && get(personPath(fid, request.auth.uid)).data.role == 'tuteur'; }
+
+    // Un mineur ne peut que : cocher des etapes de SA quete, ou la declarer terminee (jamais la valider).
+    function kidQuestOk() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return resource.data.status == 'open'
+        && (resource.data.assignedTo == request.auth.uid || resource.data.assignedTo == 'all')
+        && (
+          changed.hasOnly(['steps'])
+          || (changed.hasOnly(['status', 'doneBy', 'doneAt', 'doneNote', 'refusal'])
+              && request.resource.data.status == 'a_valider'
+              && request.resource.data.doneBy == request.auth.uid)
+        );
+    }
+
+    // Correspondance code famille -> identifiant de famille (lecture unitaire seulement, pas de liste).
+    // Lecture unitaire publique : le mineur n'est pas encore connecte quand il saisit le code.
+    // Le document ne contient que l'identifiant de famille et les pseudos des mineurs (aucune donnee personnelle).
+    match /codes/{code} {
+      allow get: if true;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['fid', 'kids'])
+        && request.resource.data.kids is list
+        && get(famPath(request.resource.data.fid)).data.ownerUid == request.auth.uid;
+      allow update: if signedIn() && isTutor(resource.data.fid)
+        && request.resource.data.keys().hasOnly(['fid', 'kids'])
+        && request.resource.data.fid == resource.data.fid
+        && request.resource.data.kids is list;
+    }
+
+    // Indique a quelle famille appartient un compte.
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['fid', 'role'])
+        && (request.auth.uid == uid || isTutor(request.resource.data.fid));
+      // Un compte ne peut plus changer sa famille ni son role apres creation.
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['fid', 'role'])
+        && request.resource.data.fid == resource.data.fid
+        && request.resource.data.role == resource.data.role;
+    }
+
+    match /families/{fid} {
+      allow read: if isMember(fid);
+      allow create: if signedIn()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['name', 'code', 'ownerUid', 'createdAt']);
+      // Le champ billing (abonnement) n'est ecrit que par le Worker : jamais par un client.
+      allow update: if isTutor(fid) && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.get('billing', null) == resource.data.get('billing', null);
+      allow delete: if false;
+
+      // Code tuteur (invitation d'un autre parent) et mots de passe des mineurs : tuteurs uniquement.
+      match /private/{docId} {
+        allow read, write: if isTutor(fid);
+      }
+
+      // Demande d'adhesion d'un tuteur : visible seulement par son auteur, jamais par les autres.
+      match /joinRequests/{uid} {
+        allow create, update: if signedIn() && request.auth.uid == uid
+          && request.resource.data.keys().hasOnly(['pin'])
+          && request.resource.data.pin is string;
+        allow read, delete: if signedIn() && request.auth.uid == uid;
+      }
+
+      match /people/{pid} {
+        allow read: if isMember(fid);
+        // Le createur de la famille, ou un parent qui connait le code tuteur.
+        allow create: if signedIn() && pid == request.auth.uid
+          && request.resource.data.role == 'tuteur'
+          && (
+            get(famPath(fid)).data.ownerUid == request.auth.uid
+            || (exists(/databases/$(database)/documents/families/$(fid)/joinRequests/$(request.auth.uid))
+                && get(/databases/$(database)/documents/families/$(fid)/joinRequests/$(request.auth.uid)).data.pin
+                   == get(/databases/$(database)/documents/families/$(fid)/private/pin).data.pin)
+          );
+        // Un tuteur ajoute un mineur.
+        allow create: if isTutor(fid) && request.resource.data.role == 'mineur';
+        allow update: if (isTutor(fid) && request.resource.data.role == resource.data.role)
+          || (signedIn() && pid == request.auth.uid
+              && request.resource.data.role == resource.data.role
+              && request.resource.data.diff(resource.data).affectedKeys()
+                   .hasOnly(['hue', 'photo', 'phone', 'goal', 'chatSeen', 'seenAt']));
+        allow delete: if isTutor(fid) && pid != request.auth.uid;
+      }
+
+      match /quests/{id} {
+        allow read: if isMember(fid);
+        allow create, delete: if isTutor(fid);
+        allow update: if isTutor(fid) || (isMember(fid) && kidQuestOk());
+      }
+
+      match /wishes/{id} {
+        allow read: if isMember(fid);
+        allow create: if isTutor(fid)
+          || (isMember(fid) && (
+               (request.resource.data.status == 'demande'
+                  && request.resource.data.by == request.auth.uid
+                  && request.resource.data['for'] == request.auth.uid)
+            || (request.resource.data.status == 'echange'
+                  && request.resource.data.redeemedBy == request.auth.uid)));
+        allow update: if isTutor(fid)
+          || (isMember(fid)
+              && resource.data.status == 'accepte'
+              && request.resource.data.status == 'echange'
+              && request.resource.data.redeemedBy == request.auth.uid
+              && request.resource.data.diff(resource.data).affectedKeys()
+                   .hasOnly(['status', 'redeemedBy', 'exchangedAt']));
+        allow delete: if isTutor(fid);
+      }
+
+      match /ledger/{id} {
+        allow read: if isMember(fid);
+        allow create: if isTutor(fid)
+          || (isMember(fid)
+              && request.resource.data.kid == request.auth.uid
+              && request.resource.data.type == 'echange'
+              && request.resource.data.delta < 0);
+        allow update, delete: if isTutor(fid);
+      }
+
+      match /notifs/{id} {
+        allow read: if isTutor(fid) || (isMember(fid) && resource.data.to == request.auth.uid);
+        allow create: if isMember(fid);
+        allow update, delete: if isTutor(fid);
+      }
+
+      // Chat : canal 'family' pour tous, canal = identifiant du mineur pour lui et les tuteurs.
+      match /messages/{id} {
+        allow read: if isTutor(fid)
+          || (isMember(fid) && (resource.data.ch == 'family' || resource.data.ch == request.auth.uid));
+        allow create: if isMember(fid)
+          && request.resource.data.from == request.auth.uid
+          && (isTutor(fid) || request.resource.data.ch == 'family' || request.resource.data.ch == request.auth.uid);
+        allow delete: if isTutor(fid) || (isMember(fid) && resource.data.from == request.auth.uid);
+      }
+
+      // Arriere-plans : chacun les siens (id = uid_onglet).
+      match /prefs/{k} {
+        allow read, write: if isMember(fid) && k.matches(request.auth.uid + '_.*');
+      }
+    }
+  }
+}
